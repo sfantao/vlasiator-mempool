@@ -3,7 +3,7 @@
     -std=c++20 \
     -I${ROCM_PATH}/include \
     -D__HIP_PLATFORM_AMD__ \
-    -fPIC -shared -O3 \
+    -fPIC -shared -g -O3 \
     -o libpreload-me.so preload-me.cpp
 exit 0
 #endif
@@ -13,6 +13,8 @@ exit 0
 #include <pthread.h>
 #include <map>
 #include <vector>
+#include <cassert>
+#include <cstring>
 
 // #include <hip/hip_runtime.h>
 
@@ -26,6 +28,9 @@ exit 0
 extern "C" {
     hipError_t hipDeviceSynchronize	(void);
     hipError_t hipStreamSynchronize (hipStream_t stream);
+    
+    void roctracer_start();
+    void roctracer_stop();
 }
 
 namespace {
@@ -46,6 +51,9 @@ int lazy_init(T *&fptr, const char *name) {
     if (ptr) return 0;
 
     ptr = dlsym(RTLD_NEXT, name);
+
+    assert(ptr);
+
     return ptr ? 0 : -1;
 }
 
@@ -61,6 +69,20 @@ hipError_t (*hipMallocAsync_orig)(void **, size_t, hipStream_t) = nullptr;
 hipError_t (*hipMallocManaged_orig)(void **, size_t, unsigned int) = nullptr;
 // hipError_t 	hipMemPrefetchAsync (const void *dev_ptr, size_t count, int device, hipStream_t stream __dparm(0))
 hipError_t (*hipMemPrefetchAsync_orig)(const void *, size_t, int, hipStream_t) = nullptr;
+
+// Name of the range of interest.
+const char *ProfileRangeName = "Propagate";
+// Instance we want of the captured region.
+int ProfileInstance = 3;
+// Variable to track the level of the captured region.
+int ProfileLevel = -1;
+// Thread that matters
+pthread_t ProfileThread = 0;
+
+// int roctxRangePushA(const char* message)
+int (*roctxRangePushA_orig)(const char*) = nullptr;
+// int roctxRangePop()
+int (*roctxRangePop_orig)() = nullptr;
 
 pthread_mutex_t MapMutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -291,7 +313,9 @@ hipError_t 	hipMallocManaged (void **ptr, size_t size, unsigned int flags = hipM
     return hipMallocManaged_orig(ptr, size, flags);
 }
 hipError_t 	hipMemPrefetchAsync (const void *dev_ptr, size_t count, int device, hipStream_t stream = 0){
-    
+    // Disable
+    return hipSuccess;
+
     // This is known to not be better than first touch;
     // return hipSuccess;
 
@@ -300,4 +324,55 @@ hipError_t 	hipMemPrefetchAsync (const void *dev_ptr, size_t count, int device, 
     //printf("In sfantao implementation of hipMemPrefetchAsync\n");
     return hipMemPrefetchAsync_orig(dev_ptr, count, device, stream);
 }
+
+int roctxRangePushA(const char* message) {
+
+    if(lazy_init(roctxRangePushA_orig, "roctxRangePushA")) return -3;
+
+    // Do we still need to look for our region?
+    if (ProfileInstance > 0)
+        // Does the region have the targe name?
+        if(!strcmp(ProfileRangeName, message)) {
+            --ProfileInstance;
+            // Is this the right instance?
+            if(!ProfileInstance) {
+
+                // Start profile!
+                roctracer_start();
+
+                ProfileThread = tid();
+                ProfileLevel = 0;
+
+                printf(" ----> Starting profile for region %s - [%ld].\n", message, ProfileThread);
+
+                return roctxRangePushA_orig(message);
+            }
+        }
+
+    if (ProfileThread && ProfileThread == tid() && ProfileLevel >= 0)
+        ++ProfileLevel;
+
+    return roctxRangePushA_orig(message);
+}
+
+int roctxRangePop() {
+
+    if(lazy_init(roctxRangePop_orig, "roctxRangePop")) return -3;
+
+    int ret = roctxRangePop_orig();
+
+    // Only th allowed thread can touch this.
+    if(ProfileThread && ProfileThread == tid()) {
+        if (ProfileLevel == 0) {
+            printf(" ----> Stopped profile for region %d.\n", ProfileLevel);
+            roctracer_stop();
+            ProfileLevel = -1;
+        } else if (ProfileLevel > 0)
+            --ProfileLevel;
+    }
+
+    return ret;
+}
+
+
 }
