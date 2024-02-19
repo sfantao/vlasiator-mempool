@@ -15,6 +15,7 @@ exit 0
 #include <vector>
 #include <cassert>
 #include <cstring>
+#include <bitset>
 
 // #include <hip/hip_runtime.h>
 
@@ -28,17 +29,13 @@ exit 0
 extern "C" {
     hipError_t hipDeviceSynchronize	(void);
     hipError_t hipStreamSynchronize (hipStream_t stream);
-    
+    hipError_t hipMemGetInfo(size_t *, size_t *);
     void roctracer_start();
     void roctracer_stop();
 }
 
 namespace {
 
-// Return the ID of the current thread
-// inline pthread_id_np_t tid() {
-//     return pthread_getthreadid_np();
-// }
 inline pthread_t tid() {
     return pthread_self();
 }
@@ -86,21 +83,22 @@ int (*roctxRangePop_orig)() = nullptr;
 
 pthread_mutex_t MapMutex = PTHREAD_MUTEX_INITIALIZER;
 
-class ThreadData {
+template<bool IsManaged>
+class PoolData {
     bool IsInitialized;
 
-    // Map to hlp account for allocations made.
-    typedef std::map<size_t,size_t> SizeToCountsMapType;
-    SizeToCountsMapType SizeMap;
+    // // Map to hlp account for allocations made.
+    // typedef std::map<size_t,size_t> SizeToCountsMapType;
+    // SizeToCountsMapType SizeMap;
 
-    // Number of increments done due to allocations in this thread.
-    size_t TotalIncrements;
+    // // Number of increments done due to allocations in this thread.
+    // size_t TotalIncrements;
 
     // Static sizes considered. Data below needs to be consistent.
     const size_t SizesI = 64;
     const size_t SizesE = 262144;
 
-#define NNN 32ul
+#define NNN 64ul
     // Slot counts of a given size - minimum is 64 bytes.
     const size_t Counts[13] = {
         NNN * 262144,  // 64
@@ -124,17 +122,20 @@ class ThreadData {
     char *chunk() {
         return reinterpret_cast<char*>(MemoryChunk);
     }
-    
+
     // A set bit in this matrix means that a slot is allocated.
     std::vector<std::vector<uint64_t>> Register;
 
 public:
-    ThreadData() : IsInitialized(false), TotalIncrements(0), MemoryChunk(nullptr), memoryChunkSize(0)  {}
+    PoolData() : IsInitialized(false), MemoryChunk(nullptr), memoryChunkSize(0)  {}
     void init() {
         if (IsInitialized)
             return;
 
-        lazy_init(hipMallocManaged_orig, "hipMallocManaged");
+        if (IsManaged)
+            lazy_init(hipMallocManaged_orig, "hipMallocManaged");
+        else
+            lazy_init(hipMalloc_orig, "hipMalloc");
 
         for(size_t i=0, c=SizesI; c <= SizesE; ++i, c*=2) {
             memoryChunkSize += c * Counts[i];
@@ -143,24 +144,30 @@ public:
             Register.emplace_back(Counts[i]/64,0);
         }
 
-        if(hipMallocManaged_orig(&MemoryChunk, memoryChunkSize, hipMemAttachGlobal))
-            printf("[thread %ld] -> failed to allocate %ld bytes.\n", tid(), memoryChunkSize);
+        hipError_t res = hipSuccess;
+        if(IsManaged)
+            res = hipMallocManaged_orig(&MemoryChunk, memoryChunkSize, hipMemAttachGlobal);
         else
-            printf("[thread %ld] -> allocated %ld bytes [%p-%p[ .\n", tid(), memoryChunkSize, MemoryChunk, reinterpret_cast<char*>(MemoryChunk) + memoryChunkSize);
+            res = hipMalloc_orig(&MemoryChunk, memoryChunkSize);
+
+        if(res)
+            printf("[thread %ld] -> failed to allocate %ld bytes (%s).\n", tid(), memoryChunkSize, IsManaged ? "managed":"regular");
+        else
+            printf("[thread %ld] -> allocated %ld bytes [%p-%p[ (%s).\n", tid(), memoryChunkSize, MemoryChunk, reinterpret_cast<char*>(MemoryChunk) + memoryChunkSize, IsManaged ? "managed":"regular");
 
         IsInitialized = true;
     }
 
-    ~ThreadData() {
+    ~PoolData() {
 
         if(!MemoryChunk)
             return;
 
         lazy_init(hipFree_orig, "hipFree");
         if(hipFree_orig(MemoryChunk))
-            printf("[thread %ld] -> failed to deallocate its chunk.\n", tid());
+            printf("[thread %ld] -> failed to deallocate %s chunk.\n", tid(), IsManaged ? "managed":"regular");
         else
-            printf("[thread %ld] -> deallocated its chunk.\n", tid());
+            printf("[thread %ld] -> deallocated %s chunk.\n", tid(), IsManaged ? "managed":"regular");
     }
 
     // Returns a pointer to a slot in the allocated chunk or null for normal treatment.
@@ -197,7 +204,7 @@ public:
             pthread_mutex_unlock(&MapMutex);
 
             // Not enough slots for the size.
-            printf("[thread %ld] -> not enough slots of size %ld.\n", tid(), c);
+            printf("[thread %ld] -> not enough slots of size %ld (%s).\n", tid(), c, IsManaged ? "managed":"regular");
 
             return nullptr;
         }
@@ -243,38 +250,23 @@ public:
         }
         return -1;
     }
-
-    void incSize(size_t s) { 
-        SizeMap.try_emplace(s,0);
-        ++SizeMap[s];
-
-        // if(++TotalIncrements % 128 == 0)
-        //     printInfo();
-    }
-    void decSize(size_t s) {
-        --SizeMap[s];
-    }
-    void printInfo() {
-        for(auto II=SizeMap.begin(), IE=SizeMap.end(); II != IE; ++II) {
-            printf("[thread %ld] -> size %ld -> %ld counts.\n", tid(), II->first, II->second);
-        }
-    }
 };
 
-ThreadData wm;
-ThreadData &getData() {
-    pthread_t t = tid();
-    return wm;
-}
+// Managed pool and regular pool.
+PoolData</*IsManaged=*/true> mpool;
+PoolData</*IsManaged=*/false> rpool;
 
 } // namespace
+
+static size_t hipMallocCount = 0;
 
 extern "C" {
 hipError_t 	hipFree (void *ptr) {
     if(lazy_init(hipFree_orig, "hipFree")) return hipErrorNotSupported;
 
-    //printf("In sfantao implementation of hipFree\n");
-    if (!getData().free(ptr))
+    if (!mpool.free(ptr))
+        return hipSuccess;
+    if (!rpool.free(ptr))
         return hipSuccess;
 
     return hipFree_orig(ptr);
@@ -282,46 +274,41 @@ hipError_t 	hipFree (void *ptr) {
 hipError_t 	hipFreeAsync (void *ptr, hipStream_t stream){
     if(lazy_init(hipFreeAsync_orig, "hipFreeAsync")) return hipErrorNotSupported;
 
-    //printf("In sfantao implementation of hipFreeAsync\n");
-    if (!getData().free(ptr, stream))
+    if (!mpool.free(ptr, stream))
+        return hipSuccess;
+    if (!rpool.free(ptr))
         return hipSuccess;
     return hipFreeAsync_orig(ptr, stream);
 }
+
 hipError_t 	hipMalloc (void **ptr, size_t size){
     if(lazy_init(hipMalloc_orig, "hipMalloc")) return hipErrorNotSupported;
 
-    //printf("In sfantao implementation of hipMalloc\n");
-    //if (*ptr = getData().allocate(size) ; *ptr)
-    //    return hipSuccess;
+    if (*ptr = rpool.allocate(size) ; *ptr)
+        return hipSuccess;
 
     return hipMalloc_orig(ptr, size);
 }
 hipError_t 	hipMallocAsync (void **ptr, size_t size, hipStream_t stream){
     if(lazy_init(hipMallocAsync_orig, "hipMallocAsync")) return hipErrorNotSupported;
 
-    //printf("In sfantao implementation of hipMallocAsync\n");
-    //if (*ptr = getData().allocate(size) ; *ptr)
-    //    return hipSuccess;
+    if (*ptr = rpool.allocate(size) ; *ptr)
+        return hipSuccess;
     return hipMallocAsync_orig(ptr, size, stream);
 }
 hipError_t 	hipMallocManaged (void **ptr, size_t size, unsigned int flags = hipMemAttachGlobal){
     if(lazy_init(hipMallocManaged_orig, "hipMallocManaged")) return hipErrorNotSupported;
 
-    //printf("In sfantao implementation of hipMallocManaged\n");
-    if (*ptr = getData().allocate(size) ; *ptr)
+    if (*ptr = mpool.allocate(size) ; *ptr)
         return hipSuccess;
     return hipMallocManaged_orig(ptr, size, flags);
 }
 hipError_t 	hipMemPrefetchAsync (const void *dev_ptr, size_t count, int device, hipStream_t stream = 0){
-    // Disable
+    // Disable.
     return hipSuccess;
-
-    // This is known to not be better than first touch;
-    // return hipSuccess;
 
     if(lazy_init(hipMemPrefetchAsync_orig, "hipMemPrefetchAsync")) return hipErrorNotSupported;
 
-    //printf("In sfantao implementation of hipMemPrefetchAsync\n");
     return hipMemPrefetchAsync_orig(dev_ptr, count, device, stream);
 }
 
@@ -361,7 +348,7 @@ int roctxRangePop() {
 
     int ret = roctxRangePop_orig();
 
-    // Only th allowed thread can touch this.
+    // Only the allowed thread can touch this.
     if(ProfileThread && ProfileThread == tid()) {
         if (ProfileLevel == 0) {
             printf(" ----> Stopped profile for region %d.\n", ProfileLevel);
