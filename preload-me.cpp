@@ -3,9 +3,9 @@
     -std=c++20 \
     -I${ROCM_PATH}/include \
     -D__HIP_PLATFORM_AMD__ \
-    -fPIC -shared -g -O3 \
+    -fPIC -shared -g -O0 \
     -o libpreload-me.so preload-me.cpp
-exit 0
+exit $?
 #endif
 
 #include <stdio.h>
@@ -17,19 +17,37 @@ exit 0
 #include <cstring>
 #include <bitset>
 
+#define FILTER_SYNCS
+
 // #include <hip/hip_runtime.h>
 
 #define hipError_t int
 #define hipSuccess 0
 #define hipEvent_t void*
 #define hipStream_t void*
+#define hipMemPool_t void*
 #define hipMemAttachGlobal 0x01
 #define hipErrorNotSupported 801
+enum hipMemPoolAttr {
+    hipMemPoolAttrDummy = 0x0
+};
+enum hipMemcpyKind {
+  hipMemcpyHostToHost = 0,
+  hipMemcpyHostToDevice = 1,
+  hipMemcpyDeviceToHost = 2,
+  hipMemcpyDeviceToDevice = 3,
+  hipMemcpyDefault
+};
+struct dim3 {
+    uint32_t x;
+    uint32_t y;
+    uint32_t z;
+};
 
 extern "C" {
-    hipError_t hipDeviceSynchronize	(void);
-    hipError_t hipStreamSynchronize (hipStream_t stream);
     hipError_t hipMemGetInfo(size_t *, size_t *);
+    hipError_t hipStreamSynchronize(hipStream_t stream);
+    hipError_t hipDeviceSynchronize();
     void roctracer_start();
     void roctracer_stop();
 }
@@ -66,6 +84,24 @@ hipError_t (*hipMallocAsync_orig)(void **, size_t, hipStream_t) = nullptr;
 hipError_t (*hipMallocManaged_orig)(void **, size_t, unsigned int) = nullptr;
 // hipError_t 	hipMemPrefetchAsync (const void *dev_ptr, size_t count, int device, hipStream_t stream __dparm(0))
 hipError_t (*hipMemPrefetchAsync_orig)(const void *, size_t, int, hipStream_t) = nullptr;
+// hipError_t hipStreamSynchronize(hipStream_t stream)
+hipError_t (*hipStreamSynchronize_orig)(hipStream_t) = nullptr;
+// hipError_t hipDeviceSynchronize()
+hipError_t (*hipDeviceSynchronize_orig)() = nullptr;
+// hipError_t hipLaunchKernel(const void* function_address, dim3 numBlocks, dim3 dimBlocks, void** args, size_t sharedMemBytes, hipStream_t stream)
+hipError_t (*hipLaunchKernel_orig)(const void*, dim3, dim3, void**, size_t, hipStream_t) = nullptr;
+// hipError_t hipMemcpyAsync(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind copyKind, hipStream_t stream)
+hipError_t (*hipMemcpyAsync_orig)(void*, const void*, size_t, hipMemcpyKind, hipStream_t) = nullptr;
+// hipError_t hipMemsetAsync(void* devPtr, int value, size_t count, hipStream_t stream)
+hipError_t (*hipMemsetAsync_orig)(void*, int, size_t, hipStream_t) = nullptr;
+// hipError_t hipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind copyKind)
+hipError_t (*hipMemcpy_orig)(void*, const void*, size_t, hipMemcpyKind) = nullptr;
+// hipError_t hipDeviceGetDefaultMemPool(hipMemPool_t* mem_pool, int device)
+hipError_t (*hipDeviceGetDefaultMemPool_orig)(hipMemPool_t*, int) = nullptr;
+// hipError_t hipMemPoolGetAttribute(hipMemPool_t mem_pool, hipMemPoolAttr attr, void* value)
+hipError_t (*hipMemPoolGetAttribute_orig)(hipMemPool_t mem_pool, hipMemPoolAttr attr, void* value) = nullptr;
+// hipError_t hipMemPoolSetAttribute(hipMemPool_t mem_pool, hipMemPoolAttr attr, void* value)
+hipError_t (*hipMemPoolSetAttribute_orig)(hipMemPool_t mem_pool, hipMemPoolAttr attr, void* value) = nullptr;
 
 // Name of the range of interest.
 const char *ProfileRangeName = "Propagate";
@@ -82,6 +118,7 @@ int (*roctxRangePushA_orig)(const char*) = nullptr;
 int (*roctxRangePop_orig)() = nullptr;
 
 pthread_mutex_t MapMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t ActivityMutex = PTHREAD_MUTEX_INITIALIZER;
 
 template<bool IsManaged>
 class PoolData {
@@ -256,12 +293,61 @@ public:
 PoolData</*IsManaged=*/true> mpool;
 PoolData</*IsManaged=*/false> rpool;
 
+// Track activity per stream
+enum ActivityType {
+    at_none,
+    at_sync,
+    at_kernel,
+    at_todev,
+    at_fromdev,
+    at_alloc,
+    at_free,
+};
+typedef std::pair<ActivityType,hipStream_t> Action;
+
+class ActivityTracker {
+    std::map<pthread_t,Action> LastKnownActivity;
+public:
+    ActivityTracker() {}
+
+    void set(ActivityType type, hipStream_t stream = 0) {
+#ifndef FILTER_SYNCS
+        return;
+#endif
+        auto v = LastKnownActivity.find(tid());
+        if (v == LastKnownActivity.end()) {
+            pthread_mutex_lock(&ActivityMutex);
+            LastKnownActivity[tid()] = Action(type,stream);
+            pthread_mutex_unlock(&ActivityMutex);
+            return;
+        }
+        v->second = Action(type,stream);
+    }
+    Action& get() {
+
+        auto v = LastKnownActivity.find(tid());
+
+        if (v == LastKnownActivity.end()) {
+            pthread_mutex_lock(&ActivityMutex);
+            Action& ret = LastKnownActivity[tid()] = Action(at_none,0);
+            pthread_mutex_unlock(&ActivityMutex);
+            return ret;
+        }
+        return v->second;
+    }
+};
+
+ActivityTracker tracker;
+
 } // namespace
 
 static size_t hipMallocCount = 0;
 
 extern "C" {
 hipError_t 	hipFree (void *ptr) {
+
+    tracker.set(at_free);
+
     if(lazy_init(hipFree_orig, "hipFree")) return hipErrorNotSupported;
 
     if (!mpool.free(ptr))
@@ -272,6 +358,9 @@ hipError_t 	hipFree (void *ptr) {
     return hipFree_orig(ptr);
 }
 hipError_t 	hipFreeAsync (void *ptr, hipStream_t stream){
+
+    tracker.set(at_free,stream);
+
     if(lazy_init(hipFreeAsync_orig, "hipFreeAsync")) return hipErrorNotSupported;
 
     if (!mpool.free(ptr, stream))
@@ -282,6 +371,9 @@ hipError_t 	hipFreeAsync (void *ptr, hipStream_t stream){
 }
 
 hipError_t 	hipMalloc (void **ptr, size_t size){
+
+    tracker.set(at_alloc);
+
     if(lazy_init(hipMalloc_orig, "hipMalloc")) return hipErrorNotSupported;
 
     if (*ptr = rpool.allocate(size) ; *ptr)
@@ -290,6 +382,9 @@ hipError_t 	hipMalloc (void **ptr, size_t size){
     return hipMalloc_orig(ptr, size);
 }
 hipError_t 	hipMallocAsync (void **ptr, size_t size, hipStream_t stream){
+
+    tracker.set(at_alloc, stream);
+
     if(lazy_init(hipMallocAsync_orig, "hipMallocAsync")) return hipErrorNotSupported;
 
     if (*ptr = rpool.allocate(size) ; *ptr)
@@ -297,6 +392,9 @@ hipError_t 	hipMallocAsync (void **ptr, size_t size, hipStream_t stream){
     return hipMallocAsync_orig(ptr, size, stream);
 }
 hipError_t 	hipMallocManaged (void **ptr, size_t size, unsigned int flags = hipMemAttachGlobal){
+
+    tracker.set(at_alloc);
+
     if(lazy_init(hipMallocManaged_orig, "hipMallocManaged")) return hipErrorNotSupported;
 
     if (*ptr = mpool.allocate(size) ; *ptr)
@@ -311,6 +409,109 @@ hipError_t 	hipMemPrefetchAsync (const void *dev_ptr, size_t count, int device, 
 
     return hipMemPrefetchAsync_orig(dev_ptr, count, device, stream);
 }
+
+#ifdef FILTER_SYNCS
+hipError_t hipStreamSynchronize(hipStream_t stream) {
+
+    // Previous action.
+    auto[paction, pstream] = tracker.get();
+
+    // if (paction != at_free && paction != at_alloc) {
+        // If the last known activity is synchronous don't need to synchronize again.
+        if (!pstream)
+            return hipSuccess;
+        else {
+            // We "likely" don't need to synchronize for transfers to the device and synchronizations on the same stream.
+            if (paction == at_sync || paction == at_todev)
+                return hipSuccess;
+        }
+    // }
+
+    tracker.set(at_sync, stream);
+
+    if(lazy_init(hipStreamSynchronize_orig, "hipStreamSynchronize")) return hipErrorNotSupported;
+
+    return hipStreamSynchronize_orig(stream);
+}
+
+hipError_t hipDeviceSynchronize() {
+
+    // Previous action.
+    auto[paction, pstream] = tracker.get();
+
+    // if (paction != at_free && paction != at_alloc) {
+        // If the last known activity is synchronous don't need to synchronize again.
+        if (!pstream)
+            return hipSuccess;
+    // }
+
+    tracker.set(at_sync);
+
+    if(lazy_init(hipDeviceSynchronize_orig, "hipDeviceSynchronize")) return hipErrorNotSupported;
+
+    return hipDeviceSynchronize_orig();
+}
+
+hipError_t hipLaunchKernel(const void* function_address, dim3 numBlocks, dim3 dimBlocks, void** args, size_t sharedMemBytes, hipStream_t stream) {
+    
+    tracker.set(at_kernel, stream);
+    
+    if(lazy_init(hipLaunchKernel_orig, "hipLaunchKernel")) return hipErrorNotSupported;
+
+    return hipLaunchKernel_orig(function_address,numBlocks,dimBlocks,args,sharedMemBytes,stream);
+}
+hipError_t hipMemcpyAsync(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind copyKind, hipStream_t stream) {
+
+    tracker.set((copyKind == hipMemcpyDeviceToHost)? at_fromdev : at_todev, stream);
+
+    if(lazy_init(hipMemcpyAsync_orig, "hipMemcpyAsync")) return hipErrorNotSupported;
+
+    return hipMemcpyAsync_orig(dst, src, sizeBytes, copyKind, stream);
+}
+hipError_t hipMemsetAsync(void* devPtr, int value, size_t count, hipStream_t stream) {
+
+    tracker.set(at_todev, stream);
+
+    if(lazy_init(hipMemsetAsync_orig, "hipMemsetAsync")) return hipErrorNotSupported;
+
+    return hipMemsetAsync_orig(devPtr, value, count, stream);
+}
+hipError_t hipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind copyKind) {
+
+    tracker.set((copyKind == hipMemcpyDeviceToHost)? at_fromdev : at_todev);
+
+    if(lazy_init(hipMemcpy_orig, "hipMemcpy")) return hipErrorNotSupported;
+
+    return hipMemcpy_orig(dst, src, sizeBytes, copyKind);
+}
+#endif
+
+hipError_t hipDeviceGetDefaultMemPool(hipMemPool_t* mem_pool, int device) {
+    // disable
+    *mem_pool = nullptr;
+    return hipSuccess;
+
+    if(lazy_init(hipDeviceGetDefaultMemPool_orig, "hipDeviceGetDefaultMemPool")) return hipErrorNotSupported;
+
+    return hipDeviceGetDefaultMemPool_orig(mem_pool, device);
+}
+hipError_t hipMemPoolGetAttribute(hipMemPool_t mem_pool, hipMemPoolAttr attr, void* value) {
+    // disable
+    return hipSuccess;
+
+    if(lazy_init(hipMemPoolGetAttribute_orig, "hipMemPoolGetAttribute")) return hipErrorNotSupported;
+
+    return hipMemPoolGetAttribute_orig(mem_pool, attr, value);
+}
+hipError_t hipMemPoolSetAttribute(hipMemPool_t mem_pool, hipMemPoolAttr attr, void* value) {
+    // disable
+    return hipSuccess;
+
+    if(lazy_init(hipMemPoolSetAttribute_orig, "hipMemPoolSetAttribute")) return hipErrorNotSupported;
+
+    return hipMemPoolSetAttribute_orig(mem_pool, attr, value);
+}
+
 
 int roctxRangePushA(const char* message) {
 
